@@ -1,0 +1,111 @@
+#!/bin/sh
+#
+# Pre-commit hook for AI-powered quality gate
+# This hook runs before each commit to check code quality
+#
+
+# Check for admin bypass
+if [ "$SKIP_AI_CHECK" = "1" ]; then
+    echo "🔓 [AI Gate] Admin bypass detected (SKIP_AI_CHECK=1), skipping AI checks"
+    REPO_ROOT="$(git rev-parse --show-toplevel)"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $(git config user.name || echo 'unknown') used bypass mechanism" >> "$REPO_ROOT/.claude/hooks/bypass.log"
+    exit 0
+fi
+
+# Get staged files
+STAGED_FILES=$(git diff --cached --name-only)
+
+if [ -z "$STAGED_FILES" ]; then
+    echo "📭 [AI Gate] No staged files to check, allowing commit"
+    exit 0
+fi
+
+echo "🔍 [AI Gate] Running AI quality checks..."
+echo ""
+
+# Get repo root for consistent paths
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Run the pass agent via Claude Code CLI
+export GIT_STAGED_FILES="$STAGED_FILES"
+export GIT_AUTHOR=$(git config user.name || echo "unknown")
+export GIT_COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "initial")
+
+# Get the diff content (first 500 lines to avoid overflow)
+STAGED_DIFF=$(git diff --cached | head -500)
+export GIT_STAGED_DIFF="$STAGED_DIFF"
+
+# Create reports directory if not exists
+HOOKS_DIR="$REPO_ROOT/.claude/hooks"
+mkdir -p "$HOOKS_DIR/reports"
+
+# Generate report filename with timestamp
+REPORT_FILE="$HOOKS_DIR/reports/report_$(date '+%Y%m%d_%H%M%S').md"
+
+# Check if claude CLI is available
+if ! command -v claude >/dev/null 2>&1; then
+    echo "⚠️ [AI Gate] Claude CLI not found, marking as error"
+    echo "【准入控制】检测异常 - Claude CLI 未安装"
+    echo "EXIT_CODE: 2" > "$REPORT_FILE"
+    echo ""
+    echo "❌ [AI Gate] Claude CLI not found, commit blocked (exit code: 2)"
+    exit 2
+fi
+
+# Run claude with the pass agent and capture output
+OUTPUT=$(timeout 120 claude --print --agent pass "请对当前暂存变更进行准入检测。变更文件：$STAGED_FILES" \
+    --append-system-prompt "当前是 pre-commit hook 环境，你需要：1) 获取暂存变更 2) 并行调用 Tester Agent 和 Quality Engineer Agent 3) 汇总两份通行证 4) 在输出的最后一行单独打印 EXIT_CODE: 0（通过）或 EXIT_CODE: 1（拒绝）或 EXIT_CODE: 2（异常）" 2>&1)
+
+EXIT_CODE_RAW=$?
+
+# Handle timeout
+if [ $EXIT_CODE_RAW -eq 124 ]; then
+    echo "⏰ [AI Gate] Claude CLI timed out (120s)"
+    OUTPUT="【准入控制】检测超时"
+    EXIT_CODE=2
+else
+    # Extract EXIT_CODE from the LAST matching line
+    EXIT_CODE=$(echo "$OUTPUT" | grep -E '^EXIT_CODE: [0-9]' | tail -1 | sed 's/EXIT_CODE: //')
+fi
+
+# Default to 2 if not found (fail-closed for safety)
+if [ -z "$EXIT_CODE" ]; then
+    EXIT_CODE=2
+fi
+
+# Save report
+{
+    echo "# AI 质量门禁报告"
+    echo ""
+    echo "- **时间**: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "- **提交者**: $GIT_AUTHOR"
+    echo "- **Commit Hash**: $GIT_COMMIT_HASH"
+    echo "- **变更文件**: $STAGED_FILES"
+    echo "- **结果**: $([ "$EXIT_CODE" = "0" ] && echo "✅ 通过" || echo "❌ 拒绝")"
+    echo ""
+    echo "---"
+    echo ""
+    echo "## 检测结果"
+    echo ""
+    echo "$OUTPUT"
+} > "$REPORT_FILE"
+
+# Display the output to the user
+echo "$OUTPUT"
+echo ""
+
+if [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "✅ [AI Gate] All checks passed, commit allowed"
+    echo "📄 [AI Gate] 报告已保存到: $REPORT_FILE"
+elif [ "$EXIT_CODE" = "1" ]; then
+    echo ""
+    echo "❌ [AI Gate] Quality checks failed, commit rejected (exit code: $EXIT_CODE)"
+    echo "📄 [AI Gate] 报告已保存到: $REPORT_FILE"
+else
+    echo ""
+    echo "⚠️ [AI Gate] Check error occurred (exit code: $EXIT_CODE)"
+    echo "📄 [AI Gate] 报告已保存到: $REPORT_FILE"
+fi
+
+exit $EXIT_CODE
